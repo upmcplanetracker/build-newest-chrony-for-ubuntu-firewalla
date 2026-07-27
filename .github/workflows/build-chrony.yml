@@ -2,8 +2,8 @@ name: Build Chrony .deb Packages
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # 6:00 AM UTC daily
-  workflow_dispatch:      # Manual trigger
+    - cron: '0 6 * * *'   # Daily at 6 AM UTC
+  workflow_dispatch:
     inputs:
       force_version:
         description: 'Force build a specific version (e.g., 4.8)'
@@ -11,7 +11,6 @@ on:
         default: ''
 
 env:
-  # Upstream source
   UPSTREAM_URL: https://chrony-project.org/releases
 
 jobs:
@@ -21,17 +20,14 @@ jobs:
       version: ${{ steps.parse.outputs.version }}
       tarball: ${{ steps.parse.outputs.tarball }}
       should_build: ${{ steps.check.outputs.should_build }}
+      tag_name: ${{ steps.parse.outputs.tag_name }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
       - name: Determine latest Chrony version
         id: parse
         run: |
           if [ -n "${{ github.event.inputs.force_version }}" ]; then
             VERSION="${{ github.event.inputs.force_version }}"
           else
-            # Scrape the releases page for the highest stable version (exclude -pre)
             VERSION=$(curl -sSL "${{ env.UPSTREAM_URL }}/" | \
               grep -oE 'chrony-[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.gz' | \
               grep -v '\-pre' | \
@@ -41,31 +37,30 @@ jobs:
 
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "tarball=chrony-${VERSION}.tar.gz" >> $GITHUB_OUTPUT
-          echo "Latest stable version: ${VERSION}"
+          echo "tag_name=chrony-${VERSION}" >> $GITHUB_OUTPUT
+          echo "Latest upstream version: ${VERSION}"
 
-      - name: Check if already built
+      - name: Check against existing GitHub Releases
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.parse.outputs.version }}"
-          TRACK_FILE=".last-built-version"
+          TAG_NAME="${{ steps.parse.outputs.tag_name }}"
 
-          if [ -f "$TRACK_FILE" ] && [ "$(cat $TRACK_FILE)" = "$VERSION" ] && [ -z "${{ github.event.inputs.force_version }}" ]; then
-            echo "Version ${VERSION} already built. Skipping."
+          # Get latest release tag from this repo; empty string if none exist yet
+          LATEST_RELEASE_TAG=$(gh release list --repo ${{ github.repository }} --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+
+          echo "Latest release tag: ${LATEST_RELEASE_TAG}"
+          echo "Target tag: ${TAG_NAME}"
+
+          if [ "$LATEST_RELEASE_TAG" = "$TAG_NAME" ] && [ -z "${{ github.event.inputs.force_version }}" ]; then
+            echo "Release ${TAG_NAME} already exists. Skipping."
             echo "should_build=false" >> $GITHUB_OUTPUT
           else
-            echo "Version ${VERSION} is new or forced. Building."
+            echo "Release ${TAG_NAME} is new or forced. Building."
             echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "$VERSION" > "$TRACK_FILE"
           fi
-
-      - name: Commit version tracker
-        if: steps.check.outputs.should_build == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .last-built-version
-          git diff --cached --quiet || git commit -m "chore: track chrony ${{ steps.parse.outputs.version }}"
-          git push
 
   build-deb:
     needs: check-version
@@ -78,7 +73,6 @@ jobs:
             pkg_suffix: "ubuntu22.04"
           - ubuntu_version: "26.04"
             pkg_suffix: "ubuntu26.04"
-            # NOTE: If ubuntu:26.04 image isn't available yet, change to ubuntu:24.04 or ubuntu:devel
 
     runs-on: ubuntu-latest
     container: ubuntu:${{ matrix.ubuntu_version }}
@@ -89,19 +83,9 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential \
-            wget \
-            ca-certificates \
-            fakeroot \
-            dpkg-dev \
-            libcap-dev \
-            libnss3-dev \
-            libedit-dev \
-            libseccomp-dev \
-            libtomcrypt-dev \
-            libtommath-dev \
-            nettle-dev \
-            pkg-config
+            build-essential wget ca-certificates fakeroot dpkg-dev \
+            libcap-dev libnss3-dev libedit-dev libseccomp-dev \
+            libtomcrypt-dev libtommath-dev nettle-dev pkg-config
 
       - name: Download Chrony source
         run: |
@@ -124,8 +108,6 @@ jobs:
             --enable-scfilter
 
           make -j$(nproc)
-
-          # Install into a staging directory for packaging
           mkdir -p /tmp/chrony-pkg
           make DESTDIR=/tmp/chrony-pkg install
 
@@ -139,7 +121,6 @@ jobs:
 
           mkdir -p "${DEB_DIR}/DEBIAN"
 
-          # Create control file
           cat > "${DEB_DIR}/DEBIAN/control" <<EOF
           Package: chrony
           Version: ${VERSION}-${SUFFIX}
@@ -156,18 +137,15 @@ jobs:
            computer clock accuracy. Built from upstream tarball for ${SUFFIX}.
           EOF
 
-          # Move staged files into deb structure
           mkdir -p "${DEB_DIR}/usr"
           cp -a "${PKG_DIR}/usr/." "${DEB_DIR}/usr/" 2>/dev/null || true
           cp -a "${PKG_DIR}/etc/." "${DEB_DIR}/etc/" 2>/dev/null || true
           cp -a "${PKG_DIR}/var/." "${DEB_DIR}/var/" 2>/dev/null || true
 
-          # Ensure binaries are in the right place
           mkdir -p "${DEB_DIR}/usr/sbin" "${DEB_DIR}/usr/bin"
           [ -f "${PKG_DIR}/usr/sbin/chronyd" ] && cp -a "${PKG_DIR}/usr/sbin/chronyd" "${DEB_DIR}/usr/sbin/"
           [ -f "${PKG_DIR}/usr/bin/chronyc" ] && cp -a "${PKG_DIR}/usr/bin/chronyc" "${DEB_DIR}/usr/bin/"
 
-          # Create systemd service file if not installed by make
           if [ ! -f "${DEB_DIR}/lib/systemd/system/chrony.service" ] && [ ! -f "${DEB_DIR}/lib/systemd/system/chronyd.service" ]; then
             mkdir -p "${DEB_DIR}/lib/systemd/system"
             cat > "${DEB_DIR}/lib/systemd/system/chrony.service" <<'EOF'
@@ -190,11 +168,9 @@ jobs:
           EOF
           fi
 
-          # Build the .deb
           dpkg-deb --root-owner-group --build "${DEB_DIR}" \
             "/tmp/chrony_${VERSION}-${SUFFIX}_${ARCH}.deb"
 
-          # Verify
           dpkg-deb -I "/tmp/chrony_${VERSION}-${SUFFIX}_${ARCH}.deb"
           dpkg-deb -c "/tmp/chrony_${VERSION}-${SUFFIX}_${ARCH}.deb"
 
@@ -222,7 +198,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: chrony-${{ needs.check-version.outputs.version }}
+          tag_name: ${{ needs.check-version.outputs.tag_name }}
           name: "Chrony ${{ needs.check-version.outputs.version }}"
           body: |
             Automated build of Chrony ${{ needs.check-version.outputs.version }} for Ubuntu.
