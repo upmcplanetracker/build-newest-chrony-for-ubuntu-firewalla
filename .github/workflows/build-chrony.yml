@@ -175,7 +175,7 @@ jobs:
           dpkg-deb -c "/tmp/chrony_${VERSION}-${SUFFIX}_${ARCH}.deb"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: chrony-${{ needs.check-version.outputs.version }}-${{ matrix.pkg_suffix }}-amd64
           path: /tmp/chrony_${{ needs.check-version.outputs.version }}-${{ matrix.pkg_suffix }}_amd64.deb
